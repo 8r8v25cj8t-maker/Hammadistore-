@@ -1,0 +1,735 @@
+#!/bin/bash
+set -e
+
+# ======= Config (غيّر هذه القيم قبل التشغيل إن رغبت) =======
+PROJECT_ROOT="/var/www/hammadi"
+BACKEND_DIR="$PROJECT_ROOT/backend"
+FRONTEND_DIR="$PROJECT_ROOT/frontend"
+SQL_FILE="$PROJECT_ROOT/hammadi_store_full.sql"
+ADMIN_SQL="$PROJECT_ROOT/admin_account.sql"
+MYSQL_ROOT_PASS="CHANGE_ME_NOW"   # <- ضع كلمة سر root لقاعدة MySQL هنا قبل التشغيل
+ADMIN_PASSWORD="momomomomo2009"   # باسورد الأدمن (سيُشفّر داخل DB)
+JWT_SECRET="replace_with_strong_jwt_secret"
+# ===========================================================
+
+echo "بدء الإعداد... (هذا السكربت يفترض Ubuntu 22.04+)"
+
+# install basics
+sudo apt update
+sudo apt install -y curl gnupg build-essential software-properties-common
+
+# install node 18
+curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
+sudo apt install -y nodejs
+
+# install nginx, mysql, certbot
+sudo apt install -y nginx mysql-server certbot python3-certbot-nginx
+
+# create project directories
+sudo mkdir -p "$BACKEND_DIR" "$FRONTEND_DIR"
+sudo chown -R $USER:$USER "$PROJECT_ROOT"
+
+echo "انشاء ملفات المشروع..."
+
+# === Write SQL file ===
+cat > "$SQL_FILE" <<'SQL'
+CREATE DATABASE IF NOT EXISTS hammadi_store CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;
+USE hammadi_store;
+
+CREATE TABLE IF NOT EXISTS users (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  name VARCHAR(150) DEFAULT '',
+  email VARCHAR(200) UNIQUE,
+  phone VARCHAR(50),
+  password_hash VARCHAR(255),
+  balance DECIMAL(12,2) DEFAULT 0.00,
+  total_spent DECIMAL(12,2) DEFAULT 0.00,
+  role ENUM('user','admin') DEFAULT 'user',
+  theme_id INT DEFAULT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS services (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  provider_service_id VARCHAR(100) DEFAULT NULL,
+  category VARCHAR(100),
+  title VARCHAR(255),
+  price_per_1000 DECIMAL(10,2),
+  min_qty INT DEFAULT 1,
+  max_qty INT DEFAULT 100000,
+  provider_id INT DEFAULT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS orders (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  user_id INT,
+  service_id INT,
+  link TEXT,
+  qty INT,
+  price DECIMAL(12,2),
+  currency VARCHAR(10) DEFAULT 'LYD',
+  status ENUM('pending','in_progress','completed','cancelled') DEFAULT 'pending',
+  provider_order_id VARCHAR(100),
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL,
+  FOREIGN KEY (service_id) REFERENCES services(id) ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS topups (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  user_id INT,
+  provider ENUM('libyana','madar'),
+  from_phone VARCHAR(50),
+  amount DECIMAL(12,2),
+  status ENUM('pending','confirmed','rejected') DEFAULT 'pending',
+  admin_note TEXT,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS api_providers (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  name VARCHAR(150),
+  api_url TEXT,
+  api_key TEXT,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS provider_mappings (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  service_id INT,
+  provider_id INT,
+  provider_service_id VARCHAR(100),
+  price_override DECIMAL(10,2) DEFAULT NULL,
+  FOREIGN KEY (service_id) REFERENCES services(id) ON DELETE CASCADE,
+  FOREIGN KEY (provider_id) REFERENCES api_providers(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS referrals (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  referrer_user_id INT,
+  referred_email VARCHAR(200),
+  referred_user_id INT DEFAULT NULL,
+  bonus_amount DECIMAL(12,2) DEFAULT 0.00,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (referrer_user_id) REFERENCES users(id) ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS notifications (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  user_id INT DEFAULT NULL,
+  type VARCHAR(100),
+  title VARCHAR(255),
+  body TEXT,
+  read_flag TINYINT(1) DEFAULT 0,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS themes (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  name VARCHAR(100),
+  css_vars TEXT,
+  is_active TINYINT(1) DEFAULT 0
+);
+
+INSERT INTO themes (name, css_vars, is_active) VALUES
+('Default Dark','--bg:#0b0f14;--panel:#0f1724;--text:#e6eef8;--accent:#6ee7b7',1),
+('Blue Night','--bg:#071029;--panel:#0b2a45;--text:#dbeafe;--accent:#60a5fa',0),
+('Emerald Dark','--bg:#02120f;--panel:#023a2f;--text:#e6fff7;--accent:#10b981',0),
+('Purple Night','--bg:#12071a;--panel:#2a0836;--text:#f3e8ff;--accent:#a78bfa',0);
+
+INSERT INTO services (category, title, price_per_1000, min_qty, max_qty) VALUES
+('عروض حمادي','لايكات فيديو تيك توك الاسرع بجوده عالية جدا - بدون ضمان', 2.00, 100, 100000),
+('عروض حمادي','متابعين تيك توك جوده وسرعة عاليه جدا', 13.00, 100, 100000),
+('عروض حمادي','متابعين انستجرام بجوده وسرعه عالية جدا - بدون ضمان ++', 14.00, 100, 100000),
+('عروض حمادي','متابعين فيسبوك علي جميع الروابط سريع - بجوده عالية', 5.00, 100, 100000);
+SQL
+
+echo "SQL file written to $SQL_FILE"
+
+# === Write admin account SQL (placeholder password will be hashed using node script below) ===
+# We will create admin using node script to hash bcrypt and insert
+cat > "$ADMIN_SQL" <<'ASQL'
+-- admin_account.sql (placeholder, will be filled by script)
+ASQL
+echo "Admin SQL placeholder created."
+
+# === Create backend files ===
+mkdir -p "$BACKEND_DIR/src/routes" "$BACKEND_DIR/src/middlewares" "$BACKEND_DIR/src/services"
+
+cat > "$BACKEND_DIR/package.json" <<'PKG'
+{
+  "name":"hammadi-backend",
+  "version":"1.2.0",
+  "main":"src/server.js",
+  "scripts":{"start":"node src/server.js","dev":"nodemon src/server.js"},
+  "dependencies":{
+    "express":"^4.18.2",
+    "mysql2":"^3.3.0",
+    "bcrypt":"^5.1.0",
+    "jsonwebtoken":"^9.0.0",
+    "cors":"^2.8.5",
+    "body-parser":"^1.20.2",
+    "axios":"^1.4.0",
+    "dotenv":"^16.3.1",
+    "socket.io":"^4.8.0"
+  },
+  "devDependencies":{"nodemon":"^2.0.22"}
+}
+PKG
+
+cat > "$BACKEND_DIR/src/server.js" <<'JS'
+require('dotenv').config();
+const express = require('express');
+const bodyParser = require('body-parser');
+const cors = require('cors');
+const http = require('http');
+const { Server } = require('socket.io');
+
+const authRoutes = require('./routes/auth');
+const ordersRoutes = require('./routes/orders');
+const topupRoutes = require('./routes/topup');
+const adminRoutes = require('./routes/admin');
+const servicesRoutes = require('./routes/services');
+const miscRoutes = require('./routes/misc');
+
+const app = express();
+app.use(cors());
+app.use(bodyParser.json());
+
+app.use('/api/auth', authRoutes);
+app.use('/api/orders', ordersRoutes);
+app.use('/api/topup', topupRoutes);
+app.use('/api/admin', adminRoutes);
+app.use('/api/services', servicesRoutes);
+app.use('/api/misc', miscRoutes);
+
+const httpServer = http.createServer(app);
+const io = new Server(httpServer, { cors: { origin: '*' } });
+
+io.use((socket, next) => {
+  const token = socket.handshake.auth?.token;
+  if(token) socket.join('admins');
+  next();
+});
+
+app.set('io', io);
+
+const port = process.env.PORT || 4000;
+httpServer.listen(port, ()=> console.log('Backend (with sockets) running on', port));
+JS
+
+cat > "$BACKEND_DIR/src/db.js" <<'DB'
+const mysql = require('mysql2/promise');
+const pool = mysql.createPool({
+  host: process.env.DB_HOST || 'localhost',
+  user: process.env.DB_USER || 'root',
+  password: process.env.DB_PASS || '',
+  database: process.env.DB_NAME || 'hammadi_store',
+  waitForConnections: true,
+  connectionLimit: 10
+});
+module.exports = pool;
+DB
+
+cat > "$BACKEND_DIR/src/middlewares/authJwt.js" <<'MJ'
+const jwt = require('jsonwebtoken');
+module.exports = function(req,res,next){
+  const header = req.headers['authorization'];
+  if(!header){ return res.status(401).json({message:'Unauthorized'}); }
+  const token = header.split(' ')[1];
+  if(!token) return res.status(401).json({message:'Unauthorized'});
+  try{
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    req.user = decoded;
+    next();
+  }catch(e){
+    return res.status(401).json({message:'Invalid token'});
+  }
+}
+MJ
+
+cat > "$BACKEND_DIR/src/routes/auth.js" <<'AUTH'
+const express = require('express');
+const router = express.Router();
+const db = require('../db');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+const authJwt = require('../middlewares/authJwt');
+
+router.post('/register', async (req,res)=>{
+  try{
+    const {name,email,password,phone,ref} = req.body;
+    if(!email || !password) return res.status(400).json({message:'Email and password required'});
+    const [exists] = await db.query('SELECT id FROM users WHERE email=?',[email]);
+    if(exists.length) return res.status(400).json({message:'Email exists'});
+    const hashed = await bcrypt.hash(password,10);
+    const [result] = await db.query('INSERT INTO users (name,email,phone,password_hash) VALUES (?,?,?,?)',[name,email,phone,hashed]);
+    const userId = result.insertId;
+    if(ref){
+      await db.query('INSERT INTO referrals (referrer_user_id,referred_email,referred_user_id) VALUES (?,?,?)',[ref,email,userId]);
+    }
+    res.json({message:'ok'});
+  }catch(e){ console.error(e); res.status(500).json({message:'Server error'}); }
+});
+
+router.post('/login', async (req,res)=>{
+  try{
+    const {email,password} = req.body;
+    const [rows] = await db.query('SELECT * FROM users WHERE email=?',[email]);
+    if(!rows.length) return res.status(400).json({message:'Invalid'});
+    const user = rows[0];
+    const match = await bcrypt.compare(password, user.password_hash);
+    if(!match) return res.status(400).json({message:'Invalid'});
+    const token = jwt.sign({id:user.id,role:user.role,email:user.email}, process.env.JWT_SECRET, {expiresIn:'7d'});
+    res.json({token, user:{id:user.id,name:user.name,email:user.email,balance:user.balance,total_spent:user.total_spent,role:user.role}});
+  }catch(e){ console.error(e); res.status(500).json({message:'Server error'}); }
+});
+
+router.get('/me', authJwt, async (req,res)=>{
+  const [rows] = await db.query('SELECT id,name,email,phone,balance,total_spent,role,theme_id FROM users WHERE id=?',[req.user.id]);
+  res.json(rows[0]);
+});
+
+module.exports = router;
+AUTH
+
+cat > "$BACKEND_DIR/src/routes/services.js" <<'SERV'
+const express = require('express');
+const router = express.Router();
+const db = require('../db');
+
+router.get('/', async (req,res)=>{
+  const category = req.query.category;
+  let q = 'SELECT * FROM services';
+  const params = [];
+  if(category){ q += ' WHERE category = ?'; params.push(category); }
+  const [rows] = await db.query(q, params);
+  res.json(rows);
+});
+
+module.exports = router;
+SERV
+
+cat > "$BACKEND_DIR/src/routes/orders.js" <<'ORD'
+const express = require('express');
+const router = express.Router();
+const authJwt = require('../middlewares/authJwt');
+const db = require('../db');
+
+router.post('/create', authJwt, async (req,res)=>{
+  try{
+    const {service_id, link, qty, referral_code} = req.body;
+    const userId = req.user.id;
+    const [serviceRows] = await db.query('SELECT * FROM services WHERE id=?',[service_id]);
+    if(!serviceRows.length) return res.status(400).json({message:'Service not found'});
+    const service = serviceRows[0];
+    const price = (parseFloat(service.price_per_1000) * parseInt(qty,10)) / 1000.0;
+    const [userRows] = await db.query('SELECT balance FROM users WHERE id=?',[userId]);
+    if(!userRows.length) return res.status(400).json({message:'User not found'});
+    const balance = parseFloat(userRows[0].balance);
+    if(balance < price) return res.status(400).json({message:'Insufficient balance'});
+    await db.query('UPDATE users SET balance = balance - ?, total_spent = total_spent + ? WHERE id=?',[price,price,userId]);
+    const [result] = await db.query('INSERT INTO orders (user_id,service_id,link,qty,price,status) VALUES (?,?,?,?,?,?)',[userId,service_id,link,qty,price,'in_progress']);
+    const orderId = result.insertId;
+
+    if(referral_code){
+      const [refRows] = await db.query('SELECT * FROM referrals WHERE id=?',[referral_code]);
+      if(refRows.length){
+        const ref = refRows[0];
+        if(ref.referrer_user_id){
+          const bonus = +(price * 0.05).toFixed(2);
+          await db.query('INSERT INTO referrals (referrer_user_id, referred_email, referred_user_id, bonus_amount) VALUES (?,?,?,?)',[ref.referrer_user_id, null, userId, bonus]);
+          await db.query('UPDATE users SET balance = balance + ? WHERE id=?',[bonus, ref.referrer_user_id]);
+          await db.query('INSERT INTO notifications (user_id,type,title,body) VALUES (?,?,?,?)',[ref.referrer_user_id,'referral','مكافأة إحالة','تم إضافة مكافأة بقيمة ' + bonus + ' د.ل']);
+        }
+      }
+    }
+
+    try{
+      const io = req.app.get('io');
+      io.to('admins').emit('new_order', {orderId, userId, service_id, qty, price});
+      await db.query('INSERT INTO notifications (type,title,body) VALUES (?,?,?)',['admin','طلب جديد','طلب رقم ' + orderId + ' تم إنشاؤه.']);
+    }catch(e){ console.error('socket error', e); }
+
+    res.json({message:'order_created', orderId});
+  }catch(err){
+    console.error(err);
+    res.status(500).json({message:'Server error'});
+  }
+});
+
+router.get('/', authJwt, async (req,res)=>{
+  const userId = req.user.id;
+  const [rows] = await db.query('SELECT o.*, s.title as service_title FROM orders o LEFT JOIN services s ON o.service_id=s.id WHERE o.user_id=? ORDER BY o.created_at DESC',[userId]);
+  res.json(rows);
+});
+
+module.exports = router;
+ORD
+
+cat > "$BACKEND_DIR/src/routes/topup.js" <<'TOP'
+const express = require('express');
+const router = express.Router();
+const authJwt = require('../middlewares/authJwt');
+const db = require('../db');
+
+router.post('/create', authJwt, async (req,res)=>{
+  try{
+    const {provider, from_phone, amount} = req.body;
+    if(!['libyana','madar'].includes(provider)) return res.status(400).json({message:'Invalid provider'});
+    const userId = req.user.id;
+    await db.query('INSERT INTO topups (user_id,provider,from_phone,amount,status) VALUES (?,?,?,?,?)',[userId,provider,from_phone,amount,'pending']);
+    await db.query('INSERT INTO notifications (type,title,body) VALUES (?,?,?)',['topup','طلب شحن جديد','طلب شحن بواسطة ' + provider + ' من ' + from_phone + ' بقيمة ' + amount]);
+    const io = req.app.get('io');
+    io.to('admins').emit('topup_requested', {userId, provider, from_phone, amount});
+    res.json({message:'pending_admin_confirmation'});
+  }catch(err){ console.error(err); res.status(500).json({message:'Server error'}); }
+});
+
+module.exports = router;
+TOP
+
+cat > "$BACKEND_DIR/src/routes/misc.js" <<'MISC'
+const express = require('express');
+const router = express.Router();
+const db = require('../db');
+const authJwt = require('../middlewares/authJwt');
+
+router.get('/themes', async (req,res)=>{
+  const [rows] = await db.query('SELECT id,name,is_active FROM themes');
+  res.json(rows);
+});
+
+router.get('/notifications', authJwt, async (req,res)=>{
+  const userId = req.user.id;
+  const role = req.user.role;
+  if(role === 'admin'){
+    const [rows] = await db.query('SELECT * FROM notifications ORDER BY created_at DESC LIMIT 200');
+    res.json(rows);
+  }else{
+    const [rows] = await db.query('SELECT * FROM notifications WHERE user_id=? ORDER BY created_at DESC LIMIT 200',[userId]);
+    res.json(rows);
+  }
+});
+
+module.exports = router;
+MISC
+
+cat > "$BACKEND_DIR/src/routes/admin.js" <<'ADM'
+const express = require('express');
+const router = express.Router();
+const authJwt = require('../middlewares/authJwt');
+const db = require('../db');
+
+const isAdmin = (req,res,next)=>{ if(req.user.role !== 'admin') return res.status(403).json({message:'Forbidden'}); next(); };
+
+router.use(authJwt);
+router.use(isAdmin);
+
+router.get('/users', async (req,res)=>{ const [rows] = await db.query('SELECT id,name,email,phone,balance,total_spent,role,created_at FROM users'); res.json(rows); });
+router.get('/orders', async (req,res)=>{ const [rows] = await db.query('SELECT o.*, u.email as user_email, s.title as service_title FROM orders o LEFT JOIN users u ON o.user_id=u.id LEFT JOIN services s ON o.service_id=s.id ORDER BY o.created_at DESC'); res.json(rows); });
+router.get('/notifications', async (req,res)=>{ const [rows] = await db.query('SELECT * FROM notifications ORDER BY created_at DESC LIMIT 500'); res.json(rows); });
+
+router.post('/topup/:id/confirm', async (req,res)=>{
+  const id = req.params.id;
+  const [rows] = await db.query('SELECT * FROM topups WHERE id=?',[id]);
+  if(!rows.length) return res.status(400).json({message:'Not found'});
+  const t = rows[0];
+  await db.query('UPDATE topups SET status=? WHERE id=?',['confirmed',id]);
+  await db.query('UPDATE users SET balance = balance + ? WHERE id=?',[t.amount, t.user_id]);
+  res.json({message:'ok'});
+});
+
+router.get('/themes', async (req,res)=>{ const [rows] = await db.query('SELECT * FROM themes'); res.json(rows); });
+router.post('/themes/create', async (req,res)=>{ const {name, css_vars} = req.body; await db.query('INSERT INTO themes (name, css_vars) VALUES (?,?)',[name,css_vars]); res.json({message:'ok'}); });
+router.post('/themes/set-active', async (req,res)=>{ const {id} = req.body; await db.query('UPDATE themes SET is_active=0'); await db.query('UPDATE themes SET is_active=1 WHERE id=?',[id]); res.json({message:'ok'}); });
+
+module.exports = router;
+ADM
+
+echo "Backend files created."
+
+# === Create frontend minimal project files ===
+mkdir -p "$FRONTEND_DIR/src/pages" "$FRONTEND_DIR/src/styles"
+
+cat > "$FRONTEND_DIR/package.json" <<'FPKG'
+{
+  "name":"hammadi-frontend",
+  "version":"1.0.0",
+  "scripts":{"dev":"next dev -p 3000","build":"next build","start":"next start -p 3000"},
+  "dependencies":{"next":"13.4.10","react":"18.2.0","react-dom":"18.2.0","axios":"^1.4.0","socket.io-client":"^4.8.0","jwt-decode":"^3.1.2"}
+}
+FPKG
+
+cat > "$FRONTEND_DIR/next.config.js" <<'NXC'
+module.exports = { reactStrictMode: true };
+NXC
+
+cat > "$FRONTEND_DIR/src/pages/_app.js" <<'APP'
+import '../../styles/globals.css'
+export default function MyApp({Component,pageProps}){ return <Component {...pageProps} /> }
+APP
+
+cat > "$FRONTEND_DIR/src/pages/index.js" <<'IDX'
+import Link from 'next/link';
+export default function Home(){
+  return (
+    <div className="container">
+      <h1>حمّادي ستور | Hammadi Store</h1>
+      <p>منصة خدمات سوشيال ميديا - افتراضي: العربية</p>
+      <div style={{display:'flex',gap:10,flexWrap:'wrap'}}>
+        <Link href="/auth/login"><a>تسجيل الدخول</a></Link>
+        <Link href="/auth/register"><a>تسجيل</a></Link>
+        <Link href="/order/new"><a>طلب جديد</a></Link>
+        <Link href="/services"><a>الخدمات</a></Link>
+        <Link href="/my-orders"><a>طلباتي</a></Link>
+        <Link href="/earn"><a>كسب المال</a></Link>
+        <Link href="/referral"><a>الإحالات</a></Link>
+        <Link href="/about"><a>من نحن</a></Link>
+      </div>
+
+      <a style={{position:'fixed',left:10,bottom:60}} href="https://wa.me/+218910882830" target="_blank" rel="noreferrer">واتساب</a>
+      <a style={{position:'fixed',left:10,bottom:30}} href="https://t.me/hammadi_store" target="_blank" rel="noreferrer">تيليغرام</a>
+    </div>
+  )
+}
+IDX
+
+# create other frontend pages (login/register/order/new/topup/my-orders/about/earn/referral/admin)
+cat > "$FRONTEND_DIR/src/pages/auth/login.js" <<'LJS'
+import {useState} from 'react';
+import axios from 'axios';
+import Router from 'next/router';
+export default function Login(){
+  const [email,setEmail]=useState(''); const [password,setPassword]=useState('');
+  const submit = async (e)=>{ e.preventDefault(); try{ const res = await axios.post(process.env.NEXT_PUBLIC_API_URL + '/api/auth/login',{email,password}); localStorage.setItem('token', res.data.token); Router.push('/dashboard'); }catch(err){ alert(err.response?.data?.message || 'Error'); }}
+  return (<div className="container"><h2>تسجيل الدخول</h2><form onSubmit={submit}><input placeholder="Email" value={email} onChange={e=>setEmail(e.target.value)} /><input placeholder="Password" type="password" value={password} onChange={e=>setPassword(e.target.value)} /><button>دخول</button></form></div>)
+}
+LJS
+
+cat > "$FRONTEND_DIR/src/pages/auth/register.js" <<'RJS'
+import {useState} from 'react';
+import axios from 'axios';
+import Router from 'next/router';
+import {useRouter} from 'next/router';
+export default function Register(){
+  const [name,setName]=useState(''); const [email,setEmail]=useState(''); const [password,setPassword]=useState('');
+  const router = useRouter();
+  const ref = router.query.ref || null;
+  const submit = async (e)=>{ e.preventDefault(); try{ await axios.post(process.env.NEXT_PUBLIC_API_URL + '/api/auth/register',{name,email,password,ref}); alert('Registered'); Router.push('/auth/login'); }catch(err){ alert(err.response?.data?.message || 'Error'); }}
+  return (<div className="container"><h2>تسجيل حساب</h2><form onSubmit={submit}><input placeholder="الاسم" value={name} onChange={e=>setName(e.target.value)} /><input placeholder="Email" value={email} onChange={e=>setEmail(e.target.value)} /><input placeholder="Password" type="password" value={password} onChange={e=>setPassword(e.target.value)} /><button>تسجيل</button></form></div>)
+}
+RJS
+
+cat > "$FRONTEND_DIR/src/pages/dashboard/index.js" <<'DASH'
+import {useEffect, useState} from 'react';
+import axios from 'axios';
+export default function Dashboard(){
+  const [user,setUser]=useState(null);
+  useEffect(()=>{
+    const token = localStorage.getItem('token');
+    if(!token) return;
+    axios.get(process.env.NEXT_PUBLIC_API_URL + '/api/auth/me', { headers: { Authorization: 'Bearer ' + token } }).then(r=>setUser(r.data)).catch(()=>{});
+  },[]);
+  return (<div className="container"><h2>لوحة الحساب</h2>{user? <div><p>الاسم: {user.name}</p><p>الرصيد: {user.balance} د.ل</p><p>إجمالي الإنفاق: {user.total_spent} د.ل</p></div> : <p>جاري التحميل...</p>}</div>)
+}
+DASH
+
+cat > "$FRONTEND_DIR/src/pages/order/new.js" <<'NEWORD'
+import {useState, useEffect} from 'react';
+import axios from 'axios';
+export default function NewOrder(){
+  const [categories,setCategories]=useState(['إنستغرام','تيك توك','يوتيوب','سناب شات','تيلغرام','عروض حمادي']);
+  const [category,setCategory]=useState('عروض حمادي');
+  const [services,setServices]=useState([]);
+  const [serviceId,setServiceId]=useState(null);
+  const [link,setLink]=useState('');
+  const [qty,setQty]=useState(100);
+  const [price,setPrice]=useState(0);
+  const [referral,setReferral]=useState('');
+
+  useEffect(()=>{ fetchServices(); },[category]);
+  async function fetchServices(){ const res = await axios.get(process.env.NEXT_PUBLIC_API_URL + '/api/services?category=' + encodeURIComponent(category)); setServices(res.data); if(res.data.length){ setServiceId(res.data[0].id); }}
+  useEffect(()=>{ const s = services.find(x=>x.id==serviceId); if(s){ setPrice((s.price_per_1000 * qty)/1000); }},[serviceId,qty,services]);
+
+  async function submit(e){ e.preventDefault(); const token = localStorage.getItem('token'); if(!token){ alert('Login first'); return; } try{ const res = await axios.post(process.env.NEXT_PUBLIC_API_URL + '/api/orders/create',{service_id:serviceId,link,qty,referral_code:referral},{ headers: { Authorization: 'Bearer ' + token }}); alert('Order created: ' + res.data.orderId); }catch(err){ alert(err.response?.data?.message || 'Error'); }}
+  return (<div className="container"> <h2>طلب جديد</h2>
+    <form onSubmit={submit}>
+      <label>الفئة</label>
+      <select value={category} onChange={e=>setCategory(e.target.value)}>{categories.map(c=> <option key={c}>{c}</option>)}</select>
+      <label>الخدمة</label>
+      <select value={serviceId} onChange={e=>setServiceId(e.target.value)}>{services.map(s=> <option key={s.id} value={s.id}>{s.title} - {s.price_per_1000} د.ل/1000</option>)}</select>
+      <label>الرابط</label>
+      <input value={link} onChange={e=>setLink(e.target.value)} />
+      <label>الكمية</label>
+      <input type="number" value={qty} onChange={e=>setQty(e.target.value)} />
+      <label>كود الاحالة (اختياري)</label>
+      <input value={referral} onChange={e=>setReferral(e.target.value)} />
+      <p>السعر النهائي: {price.toFixed(2)} د.ل</p>
+      <button>إرسال الطلب</button>
+    </form>
+  </div>)
+}
+NEWORD
+
+cat > "$FRONTEND_DIR/src/pages/topup.js" <<'TOPFR'
+import {useState} from 'react';
+import axios from 'axios';
+export default function TopUp(){
+  const [provider,setProvider]=useState('libyana');
+  const [fromPhone,setFromPhone]=useState('');
+  const [amount,setAmount]=useState('');
+  const submit = async (e)=>{ e.preventDefault(); const token = localStorage.getItem('token'); if(!token){ alert('Login first'); return; } try{ await axios.post(process.env.NEXT_PUBLIC_API_URL + '/api/topup/create',{provider,from_phone:fromPhone,amount},{ headers: { Authorization: 'Bearer ' + token }}); alert('بانتظار التأكيد من الإدارة'); }catch(err){ alert(err.response?.data?.message || 'Error'); }};
+  return (<div className="container"><h2>شحن الرصيد</h2><form onSubmit={submit}><label>الشركة</label><select value={provider} onChange={e=>setProvider(e.target.value)}><option value="libyana">ليبيانا</option><option value="madar">مدار</option></select><label>رقم الهاتف المحول منه</label><input value={fromPhone} onChange={e=>setFromPhone(e.target.value)} /><label>المبلغ</label><input value={amount} onChange={e=>setAmount(e.target.value)} /><button>إرسال طلب الشحن</button></form></div>)
+}
+TOPFR
+
+cat > "$FRONTEND_DIR/src/pages/my-orders.js" <<'MYO'
+import {useEffect,useState} from 'react';import axios from 'axios';
+export default function MyOrders(){ const [orders,setOrders]=useState([]); useEffect(()=>{ const token=localStorage.getItem('token'); if(!token) return; axios.get(process.env.NEXT_PUBLIC_API_URL + '/api/orders',{headers:{Authorization:'Bearer '+token}}).then(r=>setOrders(r.data)); },[]); return (<div className='container'><h2>طلباتي</h2>{orders.map(o=>(<div key={o.id} style={{padding:8,border:'1px solid #123',margin:8}}><strong>{o.service_title}</strong><div>حالة: {o.status}</div><div>كمية: {o.qty}</div></div>))}</div>)}
+MYO
+
+cat > "$FRONTEND_DIR/src/pages/about.js" <<'ABOUT'
+export default function About(){ return (<div className='container'><h2>من نحن</h2><p>حمّادي ستور — منصة خدمات سوشيال ميديا ليبية مصممة لتقديم خدمات سريعة وآمنة.</p></div>)}
+ABOUT
+
+cat > "$FRONTEND_DIR/src/pages/earn.js" <<'EARN'
+export default function Earn(){ return (<div className='container'><h2>كسب المال</h2><p>سجل واحصل على رابط إحالة؛ تكسب 5% من قيمة كل طلب.</p></div>)}
+EARN
+
+cat > "$FRONTEND_DIR/src/pages/referral.js" <<'REF'
+import {useEffect,useState} from 'react';import axios from 'axios';
+export default function Referral(){ const [me,setMe]=useState(null);
+useEffect(()=>{ const token=localStorage.getItem('token'); if(!token) return; axios.get(process.env.NEXT_PUBLIC_API_URL + '/api/auth/me',{ headers:{ Authorization:'Bearer '+token }}).then(r=>setMe(r.data)); },[]);
+const link = typeof window !== 'undefined' && me ? window.location.origin + '/register?ref=' + me.id : '';
+return (<div className='container'><h2>الإحالات</h2>{me? <div><p>رابط الإحالة: <code>{link}</code></p><p>تكسب 5% من قيمة كل طلب</p></div> : <p>سجّل الدخول لعرض رابط الإحالة</p>}</div>) }
+REF
+
+cat > "$FRONTEND_DIR/src/pages/services.js" <<'SERVFR'
+export default function Services(){ return (<div className='container'><h2>خدماتنا</h2><p>يمكنك الطلب من صفحة 'طلب جديد'.</p></div>)}
+SERVFR
+
+cat > "$FRONTEND_DIR/src/pages/admin/index.js" <<'ADMINPAGE'
+import {useEffect,useState} from 'react';import io from 'socket.io-client';import axios from 'axios';
+let socket;
+export default function Admin(){ const [notifs,setNotifs]=useState([]); const [orders,setOrders]=useState([]);
+useEffect(()=>{
+  const token = localStorage.getItem('token');
+  socket = io(process.env.NEXT_PUBLIC_API_URL.replace('http','ws'), { auth: { token } });
+  socket.on('connect', ()=> console.log('socket connected'));
+  socket.on('new_order', (d)=> { setOrders(prev=>[d,...prev]); setNotifs(prev=>[{title:'طلب جديد',body:'طلب رقم '+d.orderId,created_at:new Date().toISOString()}, ...prev]); });
+  axios.get(process.env.NEXT_PUBLIC_API_URL + '/api/admin/orders',{ headers: { Authorization: 'Bearer ' + token }}).then(r=>setOrders(r.data)).catch(()=>{});
+  axios.get(process.env.NEXT_PUBLIC_API_URL + '/api/admin/notifications',{ headers: { Authorization: 'Bearer ' + token }}).then(r=>setNotifs(r.data)).catch(()=>{});
+  return ()=> socket && socket.disconnect();
+},[]);
+return (<div className='container'><h2>لوحة الأدمن</h2><div style={{display:'flex',gap:20}}><div style={{flex:1}}><h3>تنبيهات</h3>{notifs.map((n,i)=>(<div key={i} style={{padding:8,border:'1px dashed #234',margin:6}}><strong>{n.title}</strong><div>{n.body}</div></div>))}</div><div style={{flex:2}}><h3>طلبات حديثة</h3>{orders.map(o=>(<div key={o.id||o.orderId} style={{padding:8,border:'1px solid #234',margin:6}}><div><strong>{o.service_title||o.service_id}</strong> - #{o.id||o.orderId}</div><div>كمية: {o.qty}</div><div>السعر: {o.price}</div></div>))}</div></div></div>) }
+ADMINPAGE
+
+cat > "$FRONTEND_DIR/src/styles/globals.css" <<'CSS'
+:root{ --bg:#0b0f14; --panel:#0f1724; --text:#e6eef8; --accent:#6ee7b7; }
+body{ margin:0; font-family:Arial, sans-serif; background:var(--bg); color:var(--text) }
+.container{ max-width:1100px; margin:30px auto; padding:18px; background:var(--panel); border-radius:8px; }
+a{ color:var(--accent); text-decoration:none }
+input,select,button{ padding:8px; margin:6px 0; border-radius:6px; background:#08121a; color:var(--text); border:1px solid #192033 }
+CSS
+
+echo "Frontend files created."
+
+# === Install backend dependencies ===
+echo "Installing backend dependencies..."
+cd "$BACKEND_DIR"
+npm install --no-audit --no-fund
+
+# === Install frontend dependencies ===
+echo "Installing frontend dependencies..."
+cd "$FRONTEND_DIR"
+npm install --no-audit --no-fund
+
+# === Import SQL into MySQL ===
+echo "Importing SQL into MySQL (requires MySQL root password)..."
+# Securely feed password using MYSQL_PWD environment variable
+export MYSQL_PWD="$MYSQL_ROOT_PASS"
+mysql -u root < "$SQL_FILE" || { echo "MySQL import failed. Check MYSQL root password and MySQL service."; exit 1; }
+
+# === Create admin user with hashed password via node ===
+echo "Creating admin user in DB..."
+node -e "
+const bcrypt = require('bcrypt');
+const mysql = require('mysql2/promise');
+(async ()=>{
+  const hash = await bcrypt.hash(process.env.ADMIN_PASS, 10);
+  const conn = await mysql.createConnection({host:'localhost', user:'root', password:process.env.MYSQL_PWD, database:'hammadi_store'});
+  await conn.query('INSERT INTO users (name,email,password_hash,role) VALUES (?,?,?,?)',['Admin','mk1707465@gmail.com', hash, 'admin']);
+  console.log('Admin inserted.');
+  await conn.end();
+})();" ADMIN_PASS="$ADMIN_PASSWORD" MYSQL_PWD="$MYSQL_PWD"
+
+# === Create sample .env for backend ===
+cat > "$BACKEND_DIR/.env" <<ENV
+PORT=4000
+DB_HOST=localhost
+DB_USER=root
+DB_PASS=$MYSQL_ROOT_PASS
+DB_NAME=hammadi_store
+JWT_SECRET=$JWT_SECRET
+ENV
+
+echo "Backend .env created at $BACKEND_DIR/.env"
+echo "You MUST change JWT_SECRET to a strong secret if you used the placeholder."
+
+# === Start backend with pm2 (optional) ===
+if command -v pm2 >/dev/null 2>&1; then
+  echo "pm2 found, starting backend with pm2..."
+  pm2 start src/server.js --name hammadi-backend --cwd "$BACKEND_DIR"
+else
+  echo "pm2 not found. Installing pm2..."
+  sudo npm install -g pm2
+  pm2 start src/server.js --name hammadi-backend --cwd "$BACKEND_DIR"
+fi
+
+# === Build and start frontend ===
+cd "$FRONTEND_DIR"
+npm run build || echo "Build step may fail on some systems; try 'npm run dev' for development."
+# start frontend with pm2 (next start)
+pm2 start npm --name hammadi-frontend -- start --cwd "$FRONTEND_DIR"
+
+# === Nginx config example ===
+NGINX_CONF="/etc/nginx/sites-available/hammadi.conf"
+sudo bash -c "cat > $NGINX_CONF" <<'NGINXCONF'
+server {
+    listen 80;
+    server_name example.com www.example.com;
+
+    location /api/ {
+        proxy_pass http://127.0.0.1:4000/;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host $host;
+        proxy_cache_bypass $http_upgrade;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:3000/;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host $host;
+        proxy_cache_bypass $http_upgrade;
+    }
+}
+NGINXCONF
+
+sudo ln -sf "$NGINX_CONF" /etc/nginx/sites-enabled/hammadi.conf
+sudo nginx -t && sudo systemctl reload nginx
+
+echo "Nginx config added. Edit /etc/nginx/sites-available/hammadi.conf and set server_name to your domain, then run: sudo certbot --nginx -d yourdomain.com -d www.yourdomain.com"
+
+echo "======== SETUP COMPLETE ========"
+echo "Project files are in: $PROJECT_ROOT"
+echo "Backend .env file: $BACKEND_DIR/.env  (edit DB_PASS/JWT_SECRET if needed)"
+echo "Admin credentials (email): mk1707465@gmail.com  password: $ADMIN_PASSWORD"
+echo "If you want, run: sudo certbot --nginx -d yourdomain.com -d www.yourdomain.com"
+echo "Then open your domain in browser (use HTTPS)."
